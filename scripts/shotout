@@ -79,6 +79,10 @@ def stop_and_transcribe():
             subprocess.run(["ydotool", "key", "29:1", "47:1", "47:0", "29:0"])
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
+        subprocess.run(
+            ["notify-send", "-u", "critical", "-t", "8000", "ShotOUT error", str(e)],
+            stderr=subprocess.DEVNULL,
+        )
     finally:
         if os.path.exists(AUDIOFILE):
             os.remove(AUDIOFILE)

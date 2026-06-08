@@ -32,6 +32,24 @@ class VoiceIndicator extends PanelMenu.Button {
 
         this._buildMenu();
 
+        // ── Cancel on click during recording ────────────────────────────────
+        // In GNOME Shell 47+ PanelMenu.Button uses a Clutter.ClickGesture
+        // (with set_recognize_on_press) whose 'recognize' handler calls
+        // menu.toggle() directly. The gesture fires before any vfunc_event
+        // or vfunc_button_press_event override on the subclass, and
+        // set_enabled(false) on the new Clutter.ClickGesture class does not
+        // reliably prevent event consumption in GNOME Shell 48/50.
+        // Intercepting menu.toggle() is the single reliable choke point:
+        // whatever mechanism triggers the click, it always ends up here.
+        const origToggle = this.menu.toggle.bind(this.menu);
+        this.menu.toggle = () => {
+            if (this._status === 'recording') {
+                this._cancelRecording();
+            } else {
+                origToggle();
+            }
+        };
+
         this._status = 'idle';
         this._recordingStartSec = 0;
         this._recordingLimitSec = 5 * 60;
@@ -43,12 +61,9 @@ class VoiceIndicator extends PanelMenu.Button {
         this.show();
     }
 
-    // ── Cancel on click during recording ────────────────────────────────────
-
     vfunc_event(event) {
         if (this._status === 'recording' &&
-            (event.type() === Clutter.EventType.BUTTON_PRESS ||
-             event.type() === Clutter.EventType.TOUCH_BEGIN)) {
+            event.type() === Clutter.EventType.TOUCH_BEGIN) {
             this._cancelRecording();
             return Clutter.EVENT_STOP;
         }
