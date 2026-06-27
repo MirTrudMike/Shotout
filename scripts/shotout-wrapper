@@ -6,6 +6,12 @@ a visual indicator in the top bar.
 
 Assign this as the hotkey command instead of shotout directly.
 The original script is never modified.
+
+Modes:
+    (no args)   toggle recording / stop + transcribe
+    --watchdog  internal: background time-limit / cancel watcher
+    --retry     re-transcribe the last recording that failed
+    --discard   drop the last failed recording without transcribing
 """
 import json
 import os
@@ -16,17 +22,24 @@ import time
 from datetime import date
 from pathlib import Path
 
-PIDFILE     = "/tmp/shotout.pid"
-START_FILE  = "/tmp/shotout-start"
-LIMIT_FILE  = "/tmp/shotout-limit"
-CANCEL_FILE = "/tmp/shotout-cancel"
-STATUS_FILE = "/tmp/shotout-status"
-STATS_FILE  = Path.home() / ".local/share/shotout/stats.json"
-ORIGINAL    = os.path.expanduser("~/.local/bin/shotout")
-SHIMS_DIR   = os.path.expanduser("~/.local/lib/shotout-shims")
+PIDFILE       = "/tmp/shotout.pid"
+START_FILE    = "/tmp/shotout-start"
+LIMIT_FILE    = "/tmp/shotout-limit"
+CANCEL_FILE   = "/tmp/shotout-cancel"
+STATUS_FILE   = "/tmp/shotout-status"
+PENDING_AUDIO = "/tmp/shotout-pending.wav"   # last recording that failed transcription
+PENDING_SECS  = "/tmp/shotout-pending-secs"  # its duration, for stats on a successful retry
+STATS_FILE    = Path.home() / ".local/share/shotout/stats.json"
+ORIGINAL      = os.path.expanduser("~/.local/bin/shotout")
+SHIMS_DIR     = os.path.expanduser("~/.local/lib/shotout-shims")
 
 TAIL_DELAY         = 1.5      # seconds to keep recording after stop hotkey
 MAX_RECORDING_SECS = 5 * 60  # safeguard: auto-stop after this many seconds
+
+# Exit codes returned by the original shotout script
+EXIT_OK     = 0   # transcribed and pasted
+EXIT_FAILED = 1   # transcription failed, audio preserved for retry
+EXIT_NOOP   = 2   # nothing to do
 
 # Prepend shims dir so fake notify-send intercepts calls from the original script
 os.environ["PATH"] = SHIMS_DIR + ":" + os.environ.get("PATH", "")
@@ -48,6 +61,13 @@ def cleanup_temp_files() -> None:
             os.remove(f)
         except OSError:
             pass
+
+
+def remove_quietly(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
 
 
 def kill_sox() -> None:
@@ -80,6 +100,22 @@ def write_stats(duration_secs: int) -> None:
     STATS_FILE.write_text(json.dumps(stats, indent=2))
 
 
+def finish(returncode: int, duration: int) -> None:
+    """Translate the original script's exit code into an indicator status."""
+    if returncode == EXIT_FAILED:
+        # Remember the recording length so a later successful retry can be counted
+        try:
+            with open(PENDING_SECS, "w") as f:
+                f.write(str(max(0, duration)))
+        except OSError:
+            pass
+        write_status("error")
+    else:
+        if returncode == EXIT_OK:
+            write_stats(duration)
+        write_status("idle")
+
+
 def run_watchdog() -> None:
     """Detached process: polls every second to handle cancel or auto-stop."""
     for _ in range(MAX_RECORDING_SECS):
@@ -99,19 +135,57 @@ def run_watchdog() -> None:
     if not os.path.exists(PIDFILE):
         return
     write_status("recognizing")
+    returncode = EXIT_OK
     try:
-        subprocess.run([ORIGINAL])
-        write_stats(MAX_RECORDING_SECS)
+        returncode = subprocess.run([ORIGINAL]).returncode
     finally:
-        write_status("idle")
+        finish(returncode, MAX_RECORDING_SECS)
         cleanup_temp_files()
 
 
-def main():
-    # Internal mode: launched as background watchdog on recording start
-    if len(sys.argv) > 1 and sys.argv[1] == "--watchdog":
-        run_watchdog()
+def handle_retry() -> None:
+    """Re-transcribe the last failed recording (manual, unlimited)."""
+    if not os.path.exists(PENDING_AUDIO):
+        write_status("idle")
         return
+    write_status("recognizing")
+    returncode = EXIT_OK
+    try:
+        returncode = subprocess.run([ORIGINAL, "--retry"]).returncode
+    finally:
+        if returncode == EXIT_FAILED:
+            write_status("error")
+        else:
+            if returncode == EXIT_OK:
+                secs = 0
+                try:
+                    secs = int(Path(PENDING_SECS).read_text().strip())
+                except Exception:
+                    pass
+                write_stats(secs)
+            remove_quietly(PENDING_SECS)
+            write_status("idle")
+
+
+def handle_discard() -> None:
+    """Drop the last failed recording without transcribing."""
+    remove_quietly(PENDING_AUDIO)
+    remove_quietly(PENDING_SECS)
+    write_status("idle")
+
+
+def main():
+    if len(sys.argv) > 1:
+        mode = sys.argv[1]
+        if mode == "--watchdog":
+            run_watchdog()
+            return
+        if mode == "--retry":
+            handle_retry()
+            return
+        if mode == "--discard":
+            handle_discard()
+            return
 
     if os.path.exists(PIDFILE):
         # Recording is already active — wait for tail, then stop and transcribe
@@ -131,14 +205,16 @@ def main():
             return
 
         write_status("recognizing")
+        returncode = EXIT_OK
         try:
-            subprocess.run([ORIGINAL] + sys.argv[1:])
-            write_stats(duration)
+            returncode = subprocess.run([ORIGINAL] + sys.argv[1:]).returncode
         finally:
-            write_status("idle")
+            finish(returncode, duration)
             cleanup_temp_files()
     else:
-        # No recording active — start one
+        # No recording active — start one. Starting discards any previous
+        # un-transcribed recording: only the most recent one is ever kept.
+        remove_quietly(PENDING_SECS)
         try:
             with open(START_FILE, "w") as f:
                 f.write(str(time.time()))

@@ -11,12 +11,14 @@ const STATUS_FILE = '/tmp/shotout-status';
 const LIMIT_FILE  = '/tmp/shotout-limit';
 const CANCEL_FILE = '/tmp/shotout-cancel';
 const STATS_FILE  = GLib.get_home_dir() + '/.local/share/shotout/stats.json';
+const WRAPPER_PATH = GLib.get_home_dir() + '/.local/bin/shotout-wrapper';
 const POLL_INTERVAL_MS = 500;
 const WARNING_SECS     = 10;   // start pulsing this many seconds before the limit
 
 const LABEL_STYLE      = 'font-size: 13px; padding: 0 6px;';
 const LABEL_STYLE_WARN = 'font-size: 13px; padding: 0 6px; color: #ff7700;';
 const LABEL_STYLE_X    = 'font-size: 18px; padding: 0 6px; color: #cc4444;';
+const LABEL_STYLE_ERR  = 'font-size: 13px; padding: 0 6px; color: #ff3333; font-weight: bold;';
 
 const VoiceIndicator = GObject.registerClass(
 class VoiceIndicator extends PanelMenu.Button {
@@ -139,6 +141,20 @@ class VoiceIndicator extends PanelMenu.Button {
     }
 
     _buildMenu() {
+        // ── Error actions — only visible when a transcription has failed ──────
+        this._retryItem = new PopupMenu.PopupMenuItem('🔁 Retry transcription');
+        this._retryItem.connect('activate', () => this._runWrapper(['--retry']));
+        this.menu.addMenuItem(this._retryItem);
+
+        this._discardItem = new PopupMenu.PopupMenuItem('🗑 Discard recording');
+        this._discardItem.connect('activate', () => this._runWrapper(['--discard']));
+        this.menu.addMenuItem(this._discardItem);
+
+        this._errorSeparator = new PopupMenu.PopupSeparatorMenuItem();
+        this.menu.addMenuItem(this._errorSeparator);
+
+        this._setErrorMenuVisible(false);
+
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem('ShotOUT'));
 
         const todayRow = this._makeStatRow('Today');
@@ -152,6 +168,21 @@ class VoiceIndicator extends PanelMenu.Button {
         this.menu.connect('open-state-changed', (_menu, isOpen) => {
             if (isOpen) this._updateMenu();
         });
+    }
+
+    _setErrorMenuVisible(visible) {
+        this._retryItem.visible = visible;
+        this._discardItem.visible = visible;
+        this._errorSeparator.visible = visible;
+    }
+
+    _runWrapper(args) {
+        try {
+            Gio.Subprocess.new([WRAPPER_PATH, ...args], Gio.SubprocessFlags.NONE);
+        } catch (e) {
+            logError(e, 'ShotOUT: failed to run wrapper');
+        }
+        this.menu.close();
     }
 
     _readStats() {
@@ -272,6 +303,7 @@ class VoiceIndicator extends PanelMenu.Button {
                 this._abortCancelAnimation();
                 this._stopWarningPulse();
                 this._resetLabelStyle();
+                this._setErrorMenuVisible(false);
                 this._recordingStartSec = GLib.get_real_time() / 1_000_000;
                 this._recordingLimitSec = this._readLimit();
             } else {
@@ -279,7 +311,18 @@ class VoiceIndicator extends PanelMenu.Button {
                 // Don't interrupt cancel animation — it will restore 🎤 on its own
                 if (!this._cancelAnimating) {
                     this._resetLabelStyle();
-                    this._label.set_text(status === 'recognizing' ? '⏳ RECOGNIZING' : '🎤');
+                    if (status === 'recognizing') {
+                        this._label.set_text('⏳ RECOGNIZING');
+                        this._setErrorMenuVisible(false);
+                    } else if (status === 'error') {
+                        // Transcription failed — keep the recording, offer retry/discard
+                        this._label.set_text('⚠ FAILED');
+                        this._label.style = LABEL_STYLE_ERR;
+                        this._setErrorMenuVisible(true);
+                    } else {
+                        this._label.set_text('🎤');
+                        this._setErrorMenuVisible(false);
+                    }
                 }
             }
         }

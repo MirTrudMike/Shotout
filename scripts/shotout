@@ -1,18 +1,35 @@
 #!/usr/bin/env python3
 """
 ShotOUT — toggle mode.
-First run: start recording.
+First run:  start recording.
 Second run: stop recording, send to Whisper, paste transcribed text.
+Retry mode (--retry): re-transcribe the last recording that failed.
+
+On a failed transcription the audio is NOT deleted: it is preserved at
+PENDING_AUDIO so it can be retried (manually, any number of times) instead of
+the user losing a long recording to a transient network/API error.
 """
 import os
 import sys
 import time
 import signal
+import shutil
 import subprocess
 
-PIDFILE = "/tmp/shotout.pid"
-AUDIOFILE = "/tmp/shotout-audio.wav"
-KEYFILE = os.path.expanduser("~/.config/shotout/key")
+PIDFILE       = "/tmp/shotout.pid"
+AUDIOFILE     = "/tmp/shotout-audio.wav"
+PENDING_AUDIO = "/tmp/shotout-pending.wav"   # last recording that failed transcription
+KEYFILE       = os.path.expanduser("~/.config/shotout/key")
+
+# Transcription retry behaviour
+REQUEST_TIMEOUT = 120.0   # seconds per Groq request (generous: long audio still transcribes fast)
+AUTO_ATTEMPTS   = 2       # automatic tries before giving up to a manual retry
+RETRY_BACKOFF   = 2.0     # seconds to wait between automatic attempts
+
+# Exit codes — read by shotout-wrapper to decide the indicator state
+EXIT_OK     = 0   # transcribed and pasted
+EXIT_FAILED = 1   # transcription failed, audio preserved at PENDING_AUDIO
+EXIT_NOOP   = 2   # nothing to do (no/empty audio)
 
 
 def get_api_key():
@@ -26,7 +43,9 @@ def get_api_key():
 
 
 def start_recording():
-    for f in [AUDIOFILE]:
+    # Starting a new recording discards any previous un-transcribed one:
+    # only the most recent recording is ever kept.
+    for f in (AUDIOFILE, PENDING_AUDIO):
         if os.path.exists(f):
             os.remove(f)
 
@@ -38,9 +57,73 @@ def start_recording():
         f.write(str(proc.pid))
 
 
+def notify_error(msg):
+    subprocess.run(
+        ["notify-send", "-u", "critical", "-t", "8000", "ShotOUT error", msg],
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def transcribe(audio_path):
+    """Send one request to Groq Whisper and return the transcribed text."""
+    from groq import Groq
+
+    client = Groq(api_key=get_api_key(), timeout=REQUEST_TIMEOUT)
+    with open(audio_path, "rb") as af:
+        result = client.audio.transcriptions.create(
+            file=("audio.wav", af.read()),
+            model="whisper-large-v3",
+            response_format="text",
+            prompt="Сегодня работаю над новым project, это очень interesting. The deadline is tomorrow. Tengo mucho trabajo hoy, но справлюсь. Mañana será otro día.",
+        )
+    return result.strip() if isinstance(result, str) else result.text.strip()
+
+
+def paste(text):
+    # wl-copy writes to the native Wayland clipboard, ydotool simulates Ctrl+V
+    time.sleep(0.2)
+    proc = subprocess.Popen(["wl-copy"], stdin=subprocess.PIPE)
+    proc.communicate(input=text.encode("utf-8"))
+    time.sleep(0.1)
+    subprocess.run(["ydotool", "key", "29:1", "47:1", "47:0", "29:0"])
+
+
+def process_audio(audio_path):
+    """
+    Try to transcribe and paste, with a few automatic attempts.
+    On success: remove the audio, return EXIT_OK.
+    On failure: preserve the audio at PENDING_AUDIO, return EXIT_FAILED.
+    """
+    last_error = None
+    for attempt in range(AUTO_ATTEMPTS):
+        try:
+            text = transcribe(audio_path)
+            if text:
+                paste(text)
+            # A completed request is a success, even if the result is empty (silence).
+            for f in (audio_path, PENDING_AUDIO):
+                if os.path.exists(f):
+                    os.remove(f)
+            return EXIT_OK
+        except Exception as e:
+            last_error = e
+            print(f"Error (attempt {attempt + 1}/{AUTO_ATTEMPTS}): {e}", file=sys.stderr)
+            if attempt + 1 < AUTO_ATTEMPTS:
+                time.sleep(RETRY_BACKOFF)
+
+    # All automatic attempts failed — keep the audio for a manual retry.
+    notify_error(str(last_error))
+    if os.path.abspath(audio_path) != os.path.abspath(PENDING_AUDIO):
+        try:
+            shutil.move(audio_path, PENDING_AUDIO)
+        except OSError:
+            pass
+    return EXIT_FAILED
+
+
 def stop_and_transcribe():
     if not os.path.exists(PIDFILE):
-        return
+        return EXIT_NOOP
 
     with open(PIDFILE) as f:
         pid = int(f.read().strip())
@@ -54,42 +137,23 @@ def stop_and_transcribe():
     time.sleep(0.4)
 
     if not os.path.exists(AUDIOFILE) or os.path.getsize(AUDIOFILE) < 1000:
-        return
+        return EXIT_NOOP
 
-    try:
-        from groq import Groq
+    return process_audio(AUDIOFILE)
 
-        client = Groq(api_key=get_api_key())
-        with open(AUDIOFILE, "rb") as af:
-            result = client.audio.transcriptions.create(
-                file=("audio.wav", af.read()),
-                model="whisper-large-v3",
-                response_format="text",
-                prompt="Сегодня работаю над новым project, это очень interesting. The deadline is tomorrow. Tengo mucho trabajo hoy, но справлюсь. Mañana será otro día.",
-            )
 
-        text = result.strip() if isinstance(result, str) else result.text.strip()
-
-        if text:
-            # wl-copy writes to the native Wayland clipboard, ydotool simulates Ctrl+V
-            time.sleep(0.2)
-            proc = subprocess.Popen(["wl-copy"], stdin=subprocess.PIPE)
-            proc.communicate(input=text.encode("utf-8"))
-            time.sleep(0.1)
-            subprocess.run(["ydotool", "key", "29:1", "47:1", "47:0", "29:0"])
-    except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
-        subprocess.run(
-            ["notify-send", "-u", "critical", "-t", "8000", "ShotOUT error", str(e)],
-            stderr=subprocess.DEVNULL,
-        )
-    finally:
-        if os.path.exists(AUDIOFILE):
-            os.remove(AUDIOFILE)
+def retry():
+    if not os.path.exists(PENDING_AUDIO) or os.path.getsize(PENDING_AUDIO) < 1000:
+        return EXIT_NOOP
+    return process_audio(PENDING_AUDIO)
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--retry":
+        sys.exit(retry())
+
     if os.path.exists(PIDFILE):
-        stop_and_transcribe()
+        sys.exit(stop_and_transcribe())
     else:
         start_recording()
+        sys.exit(EXIT_OK)
